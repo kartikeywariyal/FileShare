@@ -1,4 +1,5 @@
 import { useState, useEffect } from 'react';
+import { API_URL } from '../config/api';
 import './Dashboard.css';
 
 const Dashboard = ({ user, token, onLogout }) => {
@@ -22,7 +23,7 @@ const Dashboard = ({ user, token, onLogout }) => {
   const fetchFiles = async () => {
     setLoading(true);
     try {
-      const response = await fetch('http://localhost:3001/api/files', {
+      const response = await fetch(`${API_URL}/api/files`, {
         headers: {
           'Authorization': `Bearer ${token}`
         }
@@ -68,7 +69,7 @@ const Dashboard = ({ user, token, onLogout }) => {
       formData.append('openToAll', openToAll);
       formData.append('allowedEmails', allowedEmails);
 
-      const response = await fetch('http://localhost:3001/api/files/upload', {
+      const response = await fetch(`${API_URL}/api/files/upload`, {
         method: 'POST',
         headers: {
           'Authorization': `Bearer ${token}`
@@ -96,7 +97,7 @@ const Dashboard = ({ user, token, onLogout }) => {
 
   const handleDownload = async (file) => {
     try {
-      const response = await fetch(`http://localhost:3001/api/files/${file._id || file.id}/download`, {
+      const response = await fetch(`${API_URL}/api/files/${file._id || file.id}/download`, {
         headers: {
           'Authorization': `Bearer ${token}`
         }
@@ -132,7 +133,7 @@ const Dashboard = ({ user, token, onLogout }) => {
     setSuccess('');
 
     try {
-      const response = await fetch(`http://localhost:3001/api/files/share/${downloadId.trim()}`, {
+      const response = await fetch(`${API_URL}/api/files/share/${downloadId.trim()}`, {
         headers: {
           'Authorization': `Bearer ${token}`
         }
@@ -178,7 +179,7 @@ const Dashboard = ({ user, token, onLogout }) => {
     }
 
     try {
-      const response = await fetch(`http://localhost:3001/api/files/${fileId}`, {
+      const response = await fetch(`${API_URL}/api/files/${fileId}`, {
         method: 'DELETE',
         headers: {
           'Authorization': `Bearer ${token}`
@@ -198,7 +199,7 @@ const Dashboard = ({ user, token, onLogout }) => {
 
   const handleUpdateAccess = async (file) => {
     try {
-      const response = await fetch(`http://localhost:3001/api/files/${file._id || file.id}/access`, {
+      const response = await fetch(`${API_URL}/api/files/${file._id || file.id}/access`, {
         method: 'PUT',
         headers: {
           'Authorization': `Bearer ${token}`,

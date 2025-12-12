@@ -1,5 +1,6 @@
 import { useState, useEffect } from 'react';
 import { useParams } from 'react-router-dom';
+import { API_URL } from '../config/api';
 import './SharePage.css';
 
 const SharePage = () => {
@@ -21,7 +22,7 @@ const SharePage = () => {
         headers['Authorization'] = `Bearer ${token}`;
       }
 
-      const response = await fetch(`http://localhost:3001/api/files/share/${uniqueId}/info`, {
+      const response = await fetch(`${API_URL}/api/files/share/${uniqueId}/info`, {
         headers
       });
 
@@ -50,7 +51,7 @@ const SharePage = () => {
         headers['Authorization'] = `Bearer ${token}`;
       }
 
-      const response = await fetch(`http://localhost:3001/api/files/share/${uniqueId}`, {
+      const response = await fetch(`${API_URL}/api/files/share/${uniqueId}`, {
         headers
       });
 
