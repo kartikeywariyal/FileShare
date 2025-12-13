@@ -284,3 +284,18 @@
   text-decoration: underline;
 }
 
+.otp-input {
+  text-align: center;
+  font-size: 24px;
+  letter-spacing: 8px;
+  font-weight: 600;
+  font-family: 'Courier New', monospace;
+}
+
+.otp-hint {
+  margin-top: 8px;
+  color: #999;
+  font-size: 13px;
+  text-align: center;
+}
+

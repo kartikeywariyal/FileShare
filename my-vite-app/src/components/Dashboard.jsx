@@ -6,6 +6,7 @@ const Dashboard = ({ user, token, onLogout }) => {
   const [files, setFiles] = useState([]);
   const [loading, setLoading] = useState(false);
   const [uploading, setUploading] = useState(false);
+  const [scanning, setScanning] = useState(false);
   const [error, setError] = useState('');
   const [success, setSuccess] = useState('');
   const [showUploadModal, setShowUploadModal] = useState(false);
@@ -15,6 +16,9 @@ const Dashboard = ({ user, token, onLogout }) => {
   const [editingFile, setEditingFile] = useState(null);
   const [downloadId, setDownloadId] = useState('');
   const [downloadingById, setDownloadingById] = useState(false);
+  const [previewFile, setPreviewFile] = useState(null);
+  const [loadingPreview, setLoadingPreview] = useState(false);
+  const [showPreview, setShowPreview] = useState(false);
 
   useEffect(() => {
     fetchFiles();
@@ -36,89 +40,76 @@ const Dashboard = ({ user, token, onLogout }) => {
       const data = await response.json();
       setFiles(data);
     } catch (err) {
-      setError(err.message);
+      const errorMessage = err.message || 'Failed to fetch files. Please try again.';
+      setError(errorMessage);
+      
+      // Clear error after 5 seconds
+      setTimeout(() => {
+        setError('');
+      }, 5000);
     } finally {
       setLoading(false);
     }
   };
 
-  const handleFileSelect = (e) => {
-    const file = e.target.files[0];
-    if (!file) return;
-
-    if (file.size > 16 * 1024 * 1024) {
-      setError('File size exceeds 16MB limit');
+  const handlePreviewFile = async () => {
+    if (!downloadId.trim()) {
+      setError('Please enter a file ID');
       return;
     }
 
-    setSelectedFile(file);
-    setShowUploadModal(true);
-    setError('');
-  };
-
-  const handleFileUpload = async () => {
-    if (!selectedFile) return;
-
-    setUploading(true);
+    setLoadingPreview(true);
     setError('');
     setSuccess('');
 
     try {
-      const formData = new FormData();
-      formData.append('file', selectedFile);
-      formData.append('openToAll', openToAll);
-      formData.append('allowedEmails', allowedEmails);
-
-      const response = await fetch(`${API_URL}/api/files/upload`, {
-        method: 'POST',
-        headers: {
-          'Authorization': `Bearer ${token}`
-        },
-        body: formData
-      });
-
-      if (!response.ok) {
-        const data = await response.json();
-        throw new Error(data.error || 'Upload failed');
-      }
-
-      setSuccess('File uploaded successfully!');
-      setShowUploadModal(false);
-      setSelectedFile(null);
-      setOpenToAll(false);
-      setAllowedEmails('');
-      await fetchFiles();
-    } catch (err) {
-      setError(err.message);
-    } finally {
-      setUploading(false);
-    }
-  };
-
-  const handleDownload = async (file) => {
-    try {
-      const response = await fetch(`${API_URL}/api/files/${file._id || file.id}/download`, {
+      const response = await fetch(`${API_URL}/api/files/share/${downloadId.trim()}/info`, {
         headers: {
           'Authorization': `Bearer ${token}`
         }
+      }).catch((networkError) => {
+        throw new Error('Network error: Unable to connect to server. Please check your internet connection.');
       });
 
       if (!response.ok) {
-        const data = await response.json();
-        throw new Error(data.error || 'Download failed');
+        let errorMsg = 'Failed to load file information.';
+        let errorDetails = '';
+        
+        try {
+          const data = await response.json();
+          errorMsg = data.message || data.error || errorMsg;
+          errorDetails = data.details ? ` ${data.details}` : '';
+        } catch (parseError) {
+          // If response is not JSON, use status text
+          if (response.status === 403) {
+            errorMsg = 'Access Denied';
+            errorDetails = ' You do not have permission to access this file.';
+          } else if (response.status === 404) {
+            errorMsg = 'File Not Found';
+            errorDetails = ' No file found with the provided ID.';
+          } else {
+            errorMsg = `Error ${response.status}: ${response.statusText || 'Unknown error'}`;
+          }
+        }
+        
+        throw new Error(`${errorMsg}${errorDetails}`);
       }
 
-      const blob = await response.blob();
-      const url = window.URL.createObjectURL(blob);
-      const a = document.createElement('a');
-      a.href = url;
-      a.download = file.originalName;
-      document.body.appendChild(a);
-      a.click();
-      window.URL.revokeObjectURL(url);
-      document.body.removeChild(a);
+      const fileInfo = await response.json();
+      setPreviewFile(fileInfo);
+      setShowPreview(true);
     } catch (err) {
-      setError(err.message);
+      const errorMessage = err.message || 'Failed to preview file. Please check the ID and try again.';
+      setError(errorMessage);
+      setPreviewFile(null);
+      setShowPreview(false);
+      
+      // Clear error after 5 seconds
+      setTimeout(() => {
+        setError('');
+      }, 5000);
+    } finally {
+      setLoadingPreview(false);
     }
   };
 
@@ -137,11 +128,32 @@ const Dashboard = ({ user, token, onLogout }) => {
         headers: {
           'Authorization': `Bearer ${token}`
         }
+      }).catch((networkError) => {
+        throw new Error('Network error: Unable to connect to server. Please check your internet connection.');
       });
 
       if (!response.ok) {
-        const data = await response.json();
-        throw new Error(data.message || data.error || 'Download failed. You may not have access to this file.');
+        let errorMessage = 'Download failed.';
+        let errorDetails = '';
+        
+        try {
+          const data = await response.json();
+          errorMessage = data.message || data.error || errorMessage;
+          errorDetails = data.details ? ` ${data.details}` : '';
+        } catch (parseError) {
+          // If response is not JSON, use status text
+          if (response.status === 403) {
+            errorMessage = 'Access Denied';
+            errorDetails = ' You do not have permission to download this file.';
+          } else if (response.status === 404) {
+            errorMessage = 'File Not Found';
+            errorDetails = ' No file found with the provided ID.';
+          } else {
+            errorMessage = `Error ${response.status}: ${response.statusText || 'Unknown error'}`;
+          }
+        }
+        
+        throw new Error(`${errorMessage}${errorDetails}`);
       }
 
       // Get filename from Content-Disposition header or use a default
@@ -166,12 +178,135 @@ const Dashboard = ({ user, token, onLogout }) => {
 
       setSuccess('File downloaded successfully!');
       setDownloadId('');
+      setShowPreview(false);
+      setPreviewFile(null);
     } catch (err) {
-      setError(err.message);
+      const errorMessage = err.message || 'Download failed. Please try again.';
+      setError(errorMessage);
+      
+      // Clear error after 5 seconds
+      setTimeout(() => {
+        setError('');
+      }, 5000);
     } finally {
       setDownloadingById(false);
     }
   };
+
+  const handleFileSelect = (e) => {
+    const file = e.target.files[0];
+    if (!file) return;
+
+    if (file.size > 16 * 1024 * 1024) {
+      setError('File size exceeds 16MB limit');
+      return;
+    }
+
+    setSelectedFile(file);
+    setShowUploadModal(true);
+    setError('');
+  };
+
+  const handleFileUpload = async () => {
+    if (!selectedFile) return;
+
+    setUploading(true);
+    setScanning(true);
+    setError('');
+    setSuccess('');
+
+    try {
+      const formData = new FormData();
+      formData.append('file', selectedFile);
+      formData.append('openToAll', openToAll);
+      formData.append('allowedEmails', allowedEmails);
+
+      // Show scanning status
+      const response = await fetch(`${API_URL}/api/files/upload`, {
+        method: 'POST',
+        headers: {
+          'Authorization': `Bearer ${token}`
+        },
+        body: formData
+      });
+
+      // Scanning is done when we get response
+      setScanning(false);
+
+      if (!response.ok) {
+        const data = await response.json();
+        const errorMessage = data.message || data.error || 'Upload failed';
+        const errorDetails = data.details ? ` ${data.details}` : '';
+        throw new Error(`${errorMessage}${errorDetails}`);
+      }
+
+      setSuccess('✅ File scanned and uploaded successfully! File is virus-free.');
+      setShowUploadModal(false);
+      setSelectedFile(null);
+      setOpenToAll(false);
+      setAllowedEmails('');
+      await fetchFiles();
+      
+      // Clear success message after 5 seconds
+      setTimeout(() => {
+        setSuccess('');
+      }, 5000);
+    } catch (err) {
+      setScanning(false);
+      const errorMessage = err.message || 'Upload failed. Please try again.';
+      setError(errorMessage);
+      
+      // Clear error after 5 seconds
+      setTimeout(() => {
+        setError('');
+      }, 5000);
+    } finally {
+      setUploading(false);
+      setScanning(false);
+    }
+  };
+
+  const handleDownload = async (file) => {
+    try {
+      const response = await fetch(`${API_URL}/api/files/${file._id || file.id}/download`, {
+        headers: {
+          'Authorization': `Bearer ${token}`
+        }
+      }).catch((networkError) => {
+        throw new Error('Network error: Unable to connect to server. Please check your internet connection.');
+      });
+
+      if (!response.ok) {
+        let errorMessage = 'Download failed.';
+        try {
+          const data = await response.json();
+          errorMessage = data.error || errorMessage;
+        } catch (parseError) {
+          errorMessage = `Error ${response.status}: ${response.statusText || 'Unknown error'}`;
+        }
+        throw new Error(errorMessage);
+      }
+
+      const blob = await response.blob();
+      const url = window.URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = file.originalName;
+      document.body.appendChild(a);
+      a.click();
+      window.URL.revokeObjectURL(url);
+      document.body.removeChild(a);
+    } catch (err) {
+      const errorMessage = err.message || 'Download failed. Please try again.';
+      setError(errorMessage);
+      
+      // Clear error after 5 seconds
+      setTimeout(() => {
+        setError('');
+      }, 5000);
+    }
+  };
+
 
   const handleDelete = async (fileId) => {
     if (!window.confirm('Are you sure you want to delete this file?')) {
@@ -193,7 +328,13 @@ const Dashboard = ({ user, token, onLogout }) => {
       setSuccess('File deleted successfully!');
       await fetchFiles();
     } catch (err) {
-      setError(err.message);
+      const errorMessage = err.message || 'Delete failed. Please try again.';
+      setError(errorMessage);
+      
+      // Clear error after 5 seconds
+      setTimeout(() => {
+        setError('');
+      }, 5000);
     }
   };
 
@@ -222,7 +363,13 @@ const Dashboard = ({ user, token, onLogout }) => {
       setAllowedEmails('');
       await fetchFiles();
     } catch (err) {
-      setError(err.message);
+      const errorMessage = err.message || 'Failed to update access settings. Please try again.';
+      setError(errorMessage);
+      
+      // Clear error after 5 seconds
+      setTimeout(() => {
+        setError('');
+      }, 5000);
     }
   };
 
@@ -336,75 +483,75 @@ const Dashboard = ({ user, token, onLogout }) => {
             </div>
           </div>
 
-          <div className="download-by-id-section">
-            <div className="download-card">
-              <h2>Download File by ID</h2>
-              <p className="download-hint">Enter the unique file ID shared with you</p>
-              <div className="download-input-group">
-                <input
-                  type="text"
-                  value={downloadId}
-                  onChange={(e) => setDownloadId(e.target.value)}
-                  placeholder="Enter file unique ID (e.g., 550e8400-e29b-41d4-a716-446655440000)"
-                  className="download-id-input"
-                  disabled={downloadingById}
-                  onKeyPress={(e) => {
-                    if (e.key === 'Enter' && !downloadingById) {
-                      handleDownloadById();
-                    }
-                  }}
-                />
-                <button
-                  onClick={handleDownloadById}
-                  disabled={downloadingById || !downloadId.trim()}
-                  className="download-by-id-button"
-                >
-                  {downloadingById ? 'Downloading...' : 'Download'}
-                </button>
-              </div>
-              <p className="download-note">
-                Note: You can only download if the file is open to all or your email is authorized by the file owner.
-              </p>
-            </div>
-          </div>
 
-          {error && <div className="error-banner">{error}</div>}
+          {error && (
+            <div className="error-banner">
+              <span>{error}</span>
+              <button 
+                onClick={() => setError('')} 
+                className="error-close-button"
+                aria-label="Close error"
+              >
+                ×
+              </button>
+            </div>
+          )}
           {success && <div className="success-banner">{success}</div>}
 
           {/* Upload Modal */}
           {showUploadModal && (
-            <div className="modal-overlay" onClick={() => !uploading && setShowUploadModal(false)}>
+            <div className="modal-overlay" onClick={() => !uploading && !scanning && setShowUploadModal(false)}>
               <div className="modal-content" onClick={(e) => e.stopPropagation()}>
                 <h3>Upload File: {selectedFile?.name}</h3>
-                <div className="access-control">
-                  <label className="checkbox-label">
-                    <input
-                      type="checkbox"
-                      checked={openToAll}
-                      onChange={(e) => setOpenToAll(e.target.checked)}
-                      disabled={uploading}
-                    />
-                    <span>Open to All (Anyone can download)</span>
-                  </label>
-                  {!openToAll && (
-                    <div className="email-input-group">
-                      <label>Allowed Emails (comma-separated):</label>
-                      <input
-                        type="text"
-                        value={allowedEmails}
-                        onChange={(e) => setAllowedEmails(e.target.value)}
-                        placeholder="email1@example.com, email2@example.com"
-                        disabled={uploading}
-                      />
+                
+                {/* Virus Scanning Status */}
+                {scanning && (
+                  <div className="scanning-status">
+                    <div className="scanning-animation">
+                      <div className="scan-icon">🛡️</div>
+                      <div className="scanning-dots">
+                        <span></span>
+                        <span></span>
+                        <span></span>
+                      </div>
                     </div>
-                  )}
-                </div>
+                    <p className="scanning-text">Scanning for viruses...</p>
+                    <p className="scanning-subtext">Your file is being checked for security threats</p>
+                  </div>
+                )}
+                
+                {!scanning && (
+                  <div className="access-control">
+                    <label className="checkbox-label">
+                      <input
+                        type="checkbox"
+                        checked={openToAll}
+                        onChange={(e) => setOpenToAll(e.target.checked)}
+                        disabled={uploading || scanning}
+                      />
+                      <span>Open to All (Anyone can download)</span>
+                    </label>
+                    {!openToAll && (
+                      <div className="email-input-group">
+                        <label>Allowed Emails (comma-separated):</label>
+                        <input
+                          type="text"
+                          value={allowedEmails}
+                          onChange={(e) => setAllowedEmails(e.target.value)}
+                          placeholder="email1@example.com, email2@example.com"
+                          disabled={uploading || scanning}
+                        />
+                      </div>
+                    )}
+                  </div>
+                )}
+                
                 <div className="modal-actions">
-                  <button onClick={() => setShowUploadModal(false)} disabled={uploading} className="cancel-button">
+                  <button onClick={() => setShowUploadModal(false)} disabled={uploading || scanning} className="cancel-button">
                     Cancel
                   </button>
-                  <button onClick={handleFileUpload} disabled={uploading} className="upload-confirm-button">
-                    {uploading ? 'Uploading...' : 'Upload'}
+                  <button onClick={handleFileUpload} disabled={uploading || scanning} className="upload-confirm-button">
+                    {scanning ? 'Scanning...' : uploading ? 'Uploading...' : 'Upload'}
                   </button>
                 </div>
               </div>
@@ -538,6 +685,91 @@ const Dashboard = ({ user, token, onLogout }) => {
               </div>
             )}
           </div>
+
+          {/* Download File by ID Section */}
+          <div className="download-by-id-section">
+            <div className="download-card">
+              <h2>Download File by ID</h2>
+              <p className="download-hint">Enter the unique file ID shared with you</p>
+              <div className="download-input-group">
+                <input
+                  type="text"
+                  value={downloadId}
+                  onChange={(e) => {
+                    setDownloadId(e.target.value);
+                    setError('');
+                    setPreviewFile(null);
+                    setShowPreview(false);
+                  }}
+                  placeholder="Enter file unique ID (e.g., 550e8400-e29b-41d4-a716-446655440000)"
+                  className="download-id-input"
+                  disabled={downloadingById || loadingPreview}
+                  onKeyPress={(e) => {
+                    if (e.key === 'Enter' && !downloadingById && !loadingPreview) {
+                      handlePreviewFile();
+                    }
+                  }}
+                />
+                <div className="download-buttons">
+                  <button
+                    onClick={handlePreviewFile}
+                    disabled={loadingPreview || downloadingById || !downloadId.trim()}
+                    className="preview-button"
+                  >
+                    {loadingPreview ? 'Loading...' : 'Preview'}
+                  </button>
+                  <button
+                    onClick={handleDownloadById}
+                    disabled={downloadingById || loadingPreview || !downloadId.trim()}
+                    className="download-by-id-button"
+                  >
+                    {downloadingById ? 'Downloading...' : 'Download'}
+                  </button>
+                </div>
+              </div>
+              <p className="download-note">
+                Note: You can only download if the file is open to all or your email is authorized by the file owner.
+              </p>
+            </div>
+          </div>
+
+          {/* File Preview Modal */}
+          {showPreview && previewFile && (
+            <div className="modal-overlay" onClick={() => setShowPreview(false)}>
+              <div className="modal-content preview-modal" onClick={(e) => e.stopPropagation()}>
+                <div className="preview-header">
+                  <h3>File Preview</h3>
+                  <button onClick={() => setShowPreview(false)} className="close-button">×</button>
+                </div>
+                <div className="preview-body">
+                  <div className="preview-icon">
+                    {getFileIcon(previewFile.mimetype, previewFile.originalName)}
+                  </div>
+                  <div className="preview-info">
+                    <h4 className="preview-filename">{previewFile.originalName}</h4>
+                    <div className="preview-details">
+                      <p><strong>File Size:</strong> {formatFileSize(previewFile.size)}</p>
+                      <p><strong>File Type:</strong> {previewFile.mimetype || 'Unknown'}</p>
+                      <p><strong>Uploaded:</strong> {formatDate(previewFile.uploadDate)}</p>
+                      <p><strong>Access:</strong> 
+                        <span className={`access-badge ${previewFile.openToAll ? 'public' : 'private'}`}>
+                          {previewFile.openToAll ? ' Public' : ' Private'}
+                        </span>
+                      </p>
+                    </div>
+                  </div>
+                </div>
+                <div className="preview-actions">
+                  <button onClick={() => setShowPreview(false)} className="cancel-button">
+                    Cancel
+                  </button>
+                  <button onClick={handleDownloadById} className="download-confirm-button" disabled={downloadingById}>
+                    {downloadingById ? 'Downloading...' : 'Download File'}
+                  </button>
+                </div>
+              </div>
+            </div>
+          )}
         </div>
       </main>
     </div>

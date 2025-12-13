@@ -39,7 +39,9 @@ const SignUp = ({ onSignUp, switchToSignIn }) => {
         throw new Error(data.error || 'Sign up failed');
       }
 
-      // Token and user stored in sessionStorage by App.jsx
+      // Token and user stored in sessionStorage
+      sessionStorage.setItem('token', data.token);
+      sessionStorage.setItem('user', JSON.stringify(data.user));
       onSignUp(data);
     } catch (err) {
       setError(err.message);

@@ -6,14 +6,42 @@ import multer from 'multer';
 import mongoose from 'mongoose';
 import { v4 as uuidv4 } from 'uuid';
 import dotenv from 'dotenv';
+import nodemailer from 'nodemailer';
+import rateLimit from 'express-rate-limit';
+import crypto from 'crypto';
+import { exec } from 'child_process';
+import { promisify } from 'util';
+import fs from 'fs/promises';
+import path from 'path';
+import os from 'os';
+
+const execAsync = promisify(exec);
 
 // Load environment variables
 dotenv.config();
 
 const app = express();
 const PORT = process.env.PORT || 3001;
-const JWT_SECRET = process.env.JWT_SECRET || '2eieo2mne';
-const MONGODB_URI = process.env.MONGODB_URI || 'mongodb+srv://kartikeywariyal:kartik%4012345@cluster0.envmfus.mongodb.net/fireshare?retryWrites=true&w=majority';
+const JWT_SECRET = process.env.JWT_SECRET;
+const MONGODB_URI = process.env.MONGODB_URI;
+
+// Validate required environment variables
+if (!JWT_SECRET) {
+  console.error('❌ JWT_SECRET is required. Please set it in your .env file.');
+  process.exit(1);
+}
+
+if (!MONGODB_URI) {
+  console.error('❌ MONGODB_URI is required. Please set it in your .env file.');
+  process.exit(1);
+}
+
+// Email configuration (Brevo/Sendinblue)
+const EMAIL_USER = process.env.EMAIL_USER;
+const EMAIL_PASS = process.env.EMAIL_PASS;
+const EMAIL_HOST = process.env.EMAIL_HOST || 'smtp-relay.brevo.com';
+const EMAIL_PORT = process.env.EMAIL_PORT || 587;
+
 
 // Middleware - CORS configuration
 const corsOptions = {
@@ -49,6 +77,59 @@ app.use(cors(corsOptions));
 app.options('*', cors(corsOptions));
 app.use(express.json({ limit: '16mb' }));
 
+// Rate limiting for security
+const authLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000, // 15 minutes
+  max: 5, // limit each IP to 5 requests per windowMs
+  message: 'Too many authentication attempts, please try again later.',
+  standardHeaders: true,
+  legacyHeaders: false,
+});
+
+
+// Email transporter setup (Brevo/Sendinblue)
+let emailTransporter = null;
+if (EMAIL_USER && EMAIL_PASS) {
+  emailTransporter = nodemailer.createTransport({
+    host: EMAIL_HOST,
+    port: parseInt(EMAIL_PORT),
+    secure: false, // false for 587, true for 465
+    requireTLS: true, // Require TLS
+    auth: {
+      user: EMAIL_USER,
+      pass: EMAIL_PASS,
+    },
+    tls: {
+      rejectUnauthorized: false, // For Brevo SMTP
+      minVersion: 'TLSv1.2'
+    },
+    connectionTimeout: 10000, // 10 seconds
+    greetingTimeout: 10000,
+    socketTimeout: 10000
+  });
+  
+  console.log('📧 Email transporter created with:');
+  console.log('   Host:', EMAIL_HOST);
+  console.log('   Port:', EMAIL_PORT);
+  console.log('   User:', EMAIL_USER);
+  console.log('   Pass:', EMAIL_PASS ? '***' + EMAIL_PASS.slice(-4) : 'NOT SET');
+  
+  // Verify connection on startup
+  emailTransporter.verify(function (error, success) {
+    if (error) {
+      console.error('❌ Email service verification failed:');
+      console.error('   Error:', error.message);
+      console.error('   Code:', error.code);
+      console.error('   Command:', error.command);
+    } else {
+      console.log('✅ Email service (Brevo) configured and verified successfully');
+    }
+  });
+} else {
+  console.warn('Email credentials not configured. Email OTP will not work.');
+}
+
+
 // MongoDB Connection
 mongoose.connect(MONGODB_URI)
   .then(() => console.log('Connected to MongoDB'))
@@ -76,14 +157,178 @@ const fileSchema = new mongoose.Schema({
 const User = mongoose.model('User', userSchema);
 const File = mongoose.model('File', fileSchema);
 
+
+// Enhanced encryption helper
+const encryptData = (data, key) => {
+  const algorithm = 'aes-256-gcm';
+  const iv = crypto.randomBytes(16);
+  const cipher = crypto.createCipheriv(algorithm, Buffer.from(key, 'hex'), iv);
+  
+  let encrypted = cipher.update(data, 'utf8', 'hex');
+  encrypted += cipher.final('hex');
+  
+  const authTag = cipher.getAuthTag();
+  
+  return {
+    encrypted,
+    iv: iv.toString('hex'),
+    authTag: authTag.toString('hex')
+  };
+};
+
+const decryptData = (encryptedData, key) => {
+  const algorithm = 'aes-256-gcm';
+  const decipher = crypto.createDecipheriv(
+    algorithm,
+    Buffer.from(key, 'hex'),
+    Buffer.from(encryptedData.iv, 'hex')
+  );
+  
+  decipher.setAuthTag(Buffer.from(encryptedData.authTag, 'hex'));
+  
+  let decrypted = decipher.update(encryptedData.encrypted, 'hex', 'utf8');
+  decrypted += decipher.final('utf8');
+  
+  return decrypted;
+};
+
 // Multer configuration - store in memory as buffer
 const upload = multer({ 
   storage: multer.memoryStorage(),
   limits: { fileSize: 16 * 1024 * 1024 } // 16MB limit
 });
 
+// ClamAV configuration
+const CLAMAV_HOST = process.env.CLAMAV_HOST || 'localhost';
+const CLAMAV_PORT = parseInt(process.env.CLAMAV_PORT || '3310');
+const ENABLE_VIRUS_SCAN = process.env.ENABLE_VIRUS_SCAN !== 'false'; // Default to true
+const CLAMSCAN_PATH = process.env.CLAMSCAN_PATH || 'clamscan'; // Use 'clamscan' or 'clamdscan'
+const CLAMDSCAN_PATH = process.env.CLAMDSCAN_PATH || 'clamdscan';
+
+// Check if ClamAV is available
+async function checkClamAV() {
+  if (!ENABLE_VIRUS_SCAN) {
+    console.log('⚠️  Virus scanning is disabled');
+    return false;
+  }
+
+  try {
+    // Try to use clamdscan first (faster, uses daemon)
+    try {
+      await execAsync(`which ${CLAMDSCAN_PATH}`);
+      console.log('✅ ClamAV daemon scanner (clamdscan) found');
+      return true;
+    } catch (e) {
+      // Fallback to clamscan
+      try {
+        await execAsync(`which ${CLAMSCAN_PATH}`);
+        console.log('✅ ClamAV scanner (clamscan) found');
+        return true;
+      } catch (e2) {
+        console.error('❌ ClamAV not found. Please install ClamAV:');
+        console.error('   macOS: brew install clamav');
+        console.error('   Ubuntu/Debian: sudo apt-get install clamav clamav-daemon');
+        console.error('   Or set ENABLE_VIRUS_SCAN=false to disable scanning');
+        return false;
+      }
+    }
+  } catch (error) {
+    console.error('❌ ClamAV check failed:', error.message);
+    return false;
+  }
+}
+
+// Virus scanning function using ClamAV
+async function scanFile(buffer, filename) {
+  if (!ENABLE_VIRUS_SCAN) {
+    return { isInfected: false, viruses: [] };
+  }
+
+  const tempDir = os.tmpdir();
+  const sanitizedFilename = filename.replace(/[^a-zA-Z0-9._-]/g, '_');
+  const tempFilePath = path.join(tempDir, `scan_${Date.now()}_${sanitizedFilename}`);
+  
+  try {
+    // Write buffer to temporary file for scanning
+    await fs.writeFile(tempFilePath, buffer);
+    
+    try {
+      let scanCommand;
+      let useDaemon = false;
+      
+      // Try to use clamdscan (daemon) first - faster
+      try {
+        await execAsync(`which ${CLAMDSCAN_PATH}`);
+        scanCommand = `${CLAMDSCAN_PATH} --no-summary --infected "${tempFilePath}"`;
+        useDaemon = true;
+      } catch (e) {
+        // Fallback to clamscan (standalone)
+        scanCommand = `${CLAMSCAN_PATH} --no-summary --infected "${tempFilePath}"`;
+      }
+      
+      // Execute scan with timeout (30 seconds)
+      const { stdout, stderr } = await Promise.race([
+        execAsync(scanCommand, { timeout: 30000 }),
+        new Promise((_, reject) => 
+          setTimeout(() => reject(new Error('Scan timeout')), 30000)
+        )
+      ]);
+      
+      // Clean up temp file
+      await fs.unlink(tempFilePath).catch(() => {});
+      
+      // ClamAV returns exit code 1 if virus found, 0 if clean
+      // If stderr contains "FOUND" or exit code is 1, file is infected
+      if (stderr && (stderr.includes('FOUND') || stderr.includes('Infected'))) {
+        // Extract virus name from output
+        const virusMatch = stderr.match(/:\s*(.+?)\s+FOUND/i);
+        const virusName = virusMatch ? virusMatch[1] : 'Unknown threat';
+        
+        return {
+          isInfected: true,
+          viruses: [virusName],
+          message: `Virus detected: ${virusName}`
+        };
+      }
+      
+      // File is clean
+      return { isInfected: false, viruses: [] };
+      
+    } catch (scanError) {
+      // Clean up temp file on error
+      await fs.unlink(tempFilePath).catch(() => {});
+      
+      // Check if it's a virus detection (exit code 1)
+      if (scanError.code === 1 && scanError.stderr) {
+        const virusMatch = scanError.stderr.match(/:\s*(.+?)\s+FOUND/i);
+        const virusName = virusMatch ? virusMatch[1] : 'Unknown threat';
+        
+        return {
+          isInfected: true,
+          viruses: [virusName],
+          message: `Virus detected: ${virusName}`
+        };
+      }
+      
+      // If it's a timeout or other error, block upload for security
+      if (scanError.message === 'Scan timeout') {
+        throw new Error('Virus scan timed out. Upload blocked for security.');
+      }
+      
+      throw new Error(`Virus scan failed: ${scanError.message}. Upload blocked for security.`);
+    }
+  } catch (error) {
+    // Clean up temp file if it still exists
+    await fs.unlink(tempFilePath).catch(() => {});
+    throw error;
+  }
+}
+
+// Check ClamAV availability on startup
+checkClamAV();
+
 // JWT Authentication Middleware
-const authenticateToken = (req, res, next) => {
+const authenticateToken = async (req, res, next) => {
   const authHeader = req.headers['authorization'];
   const token = authHeader && authHeader.split(' ')[1];
 
@@ -91,12 +336,22 @@ const authenticateToken = (req, res, next) => {
     return res.status(401).json({ error: 'Access token required' });
   }
 
-  jwt.verify(token, JWT_SECRET, (err, user) => {
+  jwt.verify(token, JWT_SECRET, async (err, user) => {
     if (err) {
       return res.status(403).json({ error: 'Invalid or expired token' });
     }
-    req.user = user;
-    next();
+    
+    // Verify user still exists
+    try {
+      const dbUser = await User.findById(user.id);
+      if (!dbUser) {
+        return res.status(403).json({ error: 'User not found' });
+      }
+      req.user = user;
+      next();
+    } catch (error) {
+      return res.status(500).json({ error: 'Authentication error' });
+    }
   });
 };
 
@@ -118,12 +373,23 @@ const optionalAuth = (req, res, next) => {
 // Routes
 
 // Sign Up
-app.post('/api/auth/signup', async (req, res) => {
+app.post('/api/auth/signup', authLimiter, async (req, res) => {
   try {
     const { email, password, name } = req.body;
 
     if (!email || !password || !name) {
-      return res.status(400).json({ error: 'All fields are required' });
+      return res.status(400).json({ error: 'Email, password, and name are required' });
+    }
+
+    // Validate email format
+    const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+    if (!emailRegex.test(email)) {
+      return res.status(400).json({ error: 'Invalid email format' });
+    }
+
+    // Validate password strength
+    if (password.length < 6) {
+      return res.status(400).json({ error: 'Password must be at least 6 characters long' });
     }
 
     // Check if user already exists
@@ -152,16 +418,24 @@ app.post('/api/auth/signup', async (req, res) => {
     res.status(201).json({
       message: 'User created successfully',
       token,
-      user: { id: user._id.toString(), email: user.email, name: user.name }
+      user: {
+        id: user._id.toString(),
+        email: user.email,
+        name: user.name
+      }
     });
   } catch (error) {
     console.error('Signup error:', error);
+    if (error.code === 11000) {
+      return res.status(400).json({ error: 'User already exists' });
+    }
     res.status(500).json({ error: 'Server error' });
   }
 });
 
+
 // Sign In
-app.post('/api/auth/signin', async (req, res) => {
+app.post('/api/auth/signin', authLimiter, async (req, res) => {
   try {
     const { email, password } = req.body;
 
@@ -174,6 +448,7 @@ app.post('/api/auth/signin', async (req, res) => {
     if (!user) {
       return res.status(401).json({ error: 'Invalid credentials' });
     }
+
 
     // Verify password
     const isValidPassword = await bcrypt.compare(password, user.password);
@@ -191,7 +466,11 @@ app.post('/api/auth/signin', async (req, res) => {
     res.json({
       message: 'Sign in successful',
       token,
-      user: { id: user._id.toString(), email: user.email, name: user.name }
+      user: { 
+        id: user._id.toString(), 
+        email: user.email, 
+        name: user.name
+      }
     });
   } catch (error) {
     console.error('Signin error:', error);
@@ -199,7 +478,8 @@ app.post('/api/auth/signin', async (req, res) => {
   }
 });
 
-// Get user files
+
+// Get user's own files
 app.get('/api/files', authenticateToken, async (req, res) => {
   try {
     const userFiles = await File.find({ userId: req.user.id })
@@ -212,12 +492,56 @@ app.get('/api/files', authenticateToken, async (req, res) => {
   }
 });
 
+// Get files shared with user (files user can access)
+app.get('/api/files/shared', authenticateToken, async (req, res) => {
+  try {
+    const dbUser = await User.findById(req.user.id);
+    if (!dbUser) {
+      return res.status(404).json({ error: 'User not found' });
+    }
+
+    // Find files where:
+    // 1. User is not the owner
+    // 2. Either openToAll is true OR user's email is in allowedEmails
+    const sharedFiles = await File.find({
+      userId: { $ne: req.user.id }, // Not owned by user
+      $or: [
+        { openToAll: true },
+        { allowedEmails: dbUser.email }
+      ]
+    })
+      .select('-fileData') // Don't send file data in list
+      .populate('userId', 'name email') // Get owner info
+      .sort({ uploadDate: -1 });
+
+    res.json(sharedFiles);
+  } catch (error) {
+    console.error('Get shared files error:', error);
+    res.status(500).json({ error: 'Failed to fetch shared files' });
+  }
+});
+
 // Upload file
 app.post('/api/files/upload', authenticateToken, upload.single('file'), async (req, res) => {
   try {
     if (!req.file) {
       return res.status(400).json({ error: 'No file uploaded' });
     }
+
+    // Virus scanning
+    console.log(`🔍 Scanning file: ${req.file.originalname}`);
+    const scanResult = await scanFile(req.file.buffer, req.file.originalname);
+    
+    if (scanResult.isInfected) {
+      console.error(`❌ Virus detected in file: ${req.file.originalname}`, scanResult.viruses);
+      return res.status(403).json({ 
+        error: 'Virus Detected',
+        message: `File contains a virus or malware: ${scanResult.viruses.join(', ')}`,
+        details: 'This file has been blocked for security reasons. Please upload a clean file.'
+      });
+    }
+    
+    console.log(`✅ File scanned clean: ${req.file.originalname}`);
 
     const { openToAll, allowedEmails } = req.body;
     const uniqueId = uuidv4();
@@ -292,18 +616,35 @@ app.get('/api/files/share/:uniqueId', optionalAuth, async (req, res) => {
     const file = await File.findOne({ uniqueId: req.params.uniqueId });
 
     if (!file) {
-      return res.status(404).json({ error: 'File not found' });
+      return res.status(404).json({ 
+        error: 'File Not Found',
+        message: 'No file found with the provided ID. Please check the ID and try again.'
+      });
     }
 
     // Check access permissions
+    let userEmail = null;
+    if (req.user) {
+      const dbUser = await User.findById(req.user.id);
+      userEmail = dbUser ? dbUser.email : null;
+    }
+
     const hasAccess = file.openToAll || 
                       (req.user && file.userId.toString() === req.user.id) ||
-                      (req.user && file.allowedEmails.includes(req.user.email));
+                      (userEmail && file.allowedEmails.includes(userEmail));
 
     if (!hasAccess) {
+      const isPrivate = !file.openToAll;
+      const reason = isPrivate 
+        ? 'This file is private and your email is not authorized to access it.'
+        : 'You do not have permission to access this file.';
+      
       return res.status(403).json({ 
-        error: 'Access denied',
-        message: 'You do not have permission to access this file. Please contact the file owner for access.'
+        error: 'Access Denied',
+        message: reason,
+        details: isPrivate 
+          ? 'Please contact the file owner to add your email to the allowed list.'
+          : 'You need to be authorized by the file owner to download this file.'
       });
     }
 
@@ -320,21 +661,39 @@ app.get('/api/files/share/:uniqueId', optionalAuth, async (req, res) => {
 app.get('/api/files/share/:uniqueId/info', optionalAuth, async (req, res) => {
   try {
     const file = await File.findOne({ uniqueId: req.params.uniqueId })
-      .select('-fileData');
+      .select('-fileData')
+      .populate('userId', 'name email');
 
     if (!file) {
-      return res.status(404).json({ error: 'File not found' });
+      return res.status(404).json({ 
+        error: 'File Not Found',
+        message: 'No file found with the provided ID. Please check the ID and try again.'
+      });
     }
 
     // Check access permissions
+    let userEmail = null;
+    if (req.user) {
+      const dbUser = await User.findById(req.user.id);
+      userEmail = dbUser ? dbUser.email : null;
+    }
+
     const hasAccess = file.openToAll || 
                       (req.user && file.userId.toString() === req.user.id) ||
-                      (req.user && file.allowedEmails.includes(req.user.email));
+                      (userEmail && file.allowedEmails.includes(userEmail));
 
     if (!hasAccess) {
+      const isPrivate = !file.openToAll;
+      const reason = isPrivate 
+        ? 'This file is private and your email is not authorized to access it.'
+        : 'You do not have permission to access this file.';
+      
       return res.status(403).json({ 
-        error: 'Access denied',
-        message: 'You do not have permission to access this file. Please contact the file owner for access.'
+        error: 'Access Denied',
+        message: reason,
+        details: isPrivate 
+          ? 'Please contact the file owner to add your email to the allowed list.'
+          : 'You need to be authorized by the file owner to download this file.'
       });
     }
 
@@ -417,7 +776,44 @@ app.put('/api/files/:id/access', authenticateToken, async (req, res) => {
   }
 });
 
+// Test email endpoint (for debugging)
+app.post('/api/test-email', async (req, res) => {
+  try {
+    const { email } = req.body;
+    if (!email) {
+      return res.status(400).json({ error: 'Email is required' });
+    }
+
+    if (!emailTransporter) {
+      return res.status(500).json({ error: 'Email service not configured' });
+    }
+
+    console.log(`\n🧪 Testing email to: ${email}`);
+    const testOTP = '123456';
+    await sendEmailOTP(email, testOTP);
+    
+    res.json({ 
+      message: 'Test email sent successfully',
+      email: email,
+      otp: testOTP
+    });
+  } catch (error) {
+    console.error('Test email error:', error);
+    res.status(500).json({ 
+      error: 'Failed to send test email',
+      details: error.message
+    });
+  }
+});
+
 // Start server
 app.listen(PORT, () => {
-  console.log(`Server running on http://localhost:${PORT}`);
+  console.log(`\n🚀 Server running on http://localhost:${PORT}`);
+  console.log(`📧 Email service: ${emailTransporter ? '✅ Configured' : '❌ NOT CONFIGURED'}`);
+  if (emailTransporter) {
+    console.log(`   Host: ${EMAIL_HOST}`);
+    console.log(`   Port: ${EMAIL_PORT}`);
+    console.log(`   User: ${EMAIL_USER}`);
+  }
+  console.log('');
 });

@@ -35,10 +35,12 @@ const SignIn = ({ onSignIn, switchToSignUp }) => {
       const data = await response.json();
 
       if (!response.ok) {
-        throw new Error(data.error || 'Sign in failed');
+        throw new Error(data.error || data.message || 'Sign in failed');
       }
 
-      // Token and user stored in sessionStorage by App.jsx
+      // Token and user stored in sessionStorage
+      sessionStorage.setItem('token', data.token);
+      sessionStorage.setItem('user', JSON.stringify(data.user));
       onSignIn(data);
     } catch (err) {
       setError(err.message);
