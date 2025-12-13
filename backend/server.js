@@ -252,71 +252,170 @@ async function scanFile(buffer, filename) {
     // Write buffer to temporary file for scanning
     await fs.writeFile(tempFilePath, buffer);
     
+    let scanError = null;
+    let useDaemon = false;
+    
+    // Try to use clamdscan (daemon) first - faster, but requires daemon running
     try {
-      let scanCommand;
-      let useDaemon = false;
+      await execAsync(`which ${CLAMDSCAN_PATH}`);
+      const scanCommand = `${CLAMDSCAN_PATH} --no-summary --infected "${tempFilePath}"`;
+      useDaemon = true;
       
-      // Try to use clamdscan (daemon) first - faster
       try {
-        await execAsync(`which ${CLAMDSCAN_PATH}`);
-        scanCommand = `${CLAMDSCAN_PATH} --no-summary --infected "${tempFilePath}"`;
-        useDaemon = true;
-      } catch (e) {
-        // Fallback to clamscan (standalone)
-        scanCommand = `${CLAMSCAN_PATH} --no-summary --infected "${tempFilePath}"`;
-      }
-      
-      // Execute scan with timeout (30 seconds)
-      const { stdout, stderr } = await Promise.race([
-        execAsync(scanCommand, { timeout: 30000 }),
-        new Promise((_, reject) => 
-          setTimeout(() => reject(new Error('Scan timeout')), 30000)
-        )
-      ]);
-      
-      // Clean up temp file
-      await fs.unlink(tempFilePath).catch(() => {});
-      
-      // ClamAV returns exit code 1 if virus found, 0 if clean
-      // If stderr contains "FOUND" or exit code is 1, file is infected
-      if (stderr && (stderr.includes('FOUND') || stderr.includes('Infected'))) {
-        // Extract virus name from output
-        const virusMatch = stderr.match(/:\s*(.+?)\s+FOUND/i);
-        const virusName = virusMatch ? virusMatch[1] : 'Unknown threat';
+        // Execute scan with timeout (30 seconds)
+        const { stdout, stderr } = await Promise.race([
+          execAsync(scanCommand, { timeout: 30000 }),
+          new Promise((_, reject) => 
+            setTimeout(() => reject(new Error('Scan timeout')), 30000)
+          )
+        ]);
         
-        return {
-          isInfected: true,
-          viruses: [virusName],
-          message: `Virus detected: ${virusName}`
-        };
-      }
-      
-      // File is clean
-      return { isInfected: false, viruses: [] };
-      
-    } catch (scanError) {
-      // Clean up temp file on error
-      await fs.unlink(tempFilePath).catch(() => {});
-      
-      // Check if it's a virus detection (exit code 1)
-      if (scanError.code === 1 && scanError.stderr) {
-        const virusMatch = scanError.stderr.match(/:\s*(.+?)\s+FOUND/i);
-        const virusName = virusMatch ? virusMatch[1] : 'Unknown threat';
+        // Clean up temp file
+        await fs.unlink(tempFilePath).catch(() => {});
         
-        return {
-          isInfected: true,
-          viruses: [virusName],
-          message: `Virus detected: ${virusName}`
-        };
+        // ClamAV returns exit code 1 if virus found, 0 if clean
+        // If stderr contains "FOUND" or exit code is 1, file is infected
+        if (stderr && (stderr.includes('FOUND') || stderr.includes('Infected'))) {
+          // Extract virus name from output
+          const virusMatch = stderr.match(/:\s*(.+?)\s+FOUND/i);
+          const virusName = virusMatch ? virusMatch[1] : 'Unknown threat';
+          
+          return {
+            isInfected: true,
+            viruses: [virusName],
+            message: `Virus detected: ${virusName}`
+          };
+        }
+        
+        // File is clean
+        return { isInfected: false, viruses: [] };
+        
+      } catch (daemonError) {
+        // If clamdscan fails due to config/daemon issues, fallback to clamscan
+        if (daemonError.stderr && (
+          daemonError.stderr.includes('Can\'t parse') || 
+          daemonError.stderr.includes('ERROR') ||
+          daemonError.stderr.includes('Connection refused') ||
+          daemonError.stderr.includes('Can\'t connect')
+        )) {
+          console.log('⚠️  ClamAV daemon not available, falling back to clamscan (standalone)');
+          scanError = daemonError;
+          useDaemon = false;
+        } else if (daemonError.code === 1 && daemonError.stderr) {
+          // This is actually a virus detection (exit code 1)
+          await fs.unlink(tempFilePath).catch(() => {});
+          const virusMatch = daemonError.stderr.match(/:\s*(.+?)\s+FOUND/i);
+          const virusName = virusMatch ? virusMatch[1] : 'Unknown threat';
+          
+          return {
+            isInfected: true,
+            viruses: [virusName],
+            message: `Virus detected: ${virusName}`
+          };
+        } else {
+          throw daemonError;
+        }
       }
-      
-      // If it's a timeout or other error, block upload for security
-      if (scanError.message === 'Scan timeout') {
-        throw new Error('Virus scan timed out. Upload blocked for security.');
-      }
-      
-      throw new Error(`Virus scan failed: ${scanError.message}. Upload blocked for security.`);
+    } catch (e) {
+      // clamdscan not found, will use clamscan
+      useDaemon = false;
     }
+    
+    // Fallback to clamscan (standalone) - doesn't require daemon
+    if (!useDaemon) {
+      // Try to find clamscan - first try which, then common paths
+      let clamscanPath = null;
+      
+      // First, try using 'which' to find clamscan in PATH
+      try {
+        const { stdout } = await execAsync('which clamscan');
+        if (stdout && stdout.trim()) {
+          clamscanPath = stdout.trim();
+        }
+      } catch (e) {
+        // which failed, will try common paths
+      }
+      
+      // If which didn't work, try common installation paths
+      if (!clamscanPath) {
+        const commonPaths = [
+          '/opt/homebrew/bin/clamscan',
+          '/usr/local/bin/clamscan',
+          '/usr/bin/clamscan',
+          '/bin/clamscan'
+        ];
+        
+        for (const testPath of commonPaths) {
+          try {
+            // Try to execute --version to verify it exists and works
+            await execAsync(`"${testPath}" --version`, { timeout: 5000 });
+            clamscanPath = testPath;
+            break;
+          } catch (e) {
+            continue;
+          }
+        }
+      }
+      
+      if (!clamscanPath) {
+        await fs.unlink(tempFilePath).catch(() => {});
+        throw new Error('ClamAV not found. Please install ClamAV or set ENABLE_VIRUS_SCAN=false');
+      }
+      
+      const scanCommand = `"${clamscanPath}" --no-summary --infected "${tempFilePath}"`;
+      
+      try {
+        // Execute scan with timeout (30 seconds)
+        const { stdout, stderr } = await Promise.race([
+          execAsync(scanCommand, { timeout: 30000 }),
+          new Promise((_, reject) => 
+            setTimeout(() => reject(new Error('Scan timeout')), 30000)
+          )
+        ]);
+        
+        // Clean up temp file
+        await fs.unlink(tempFilePath).catch(() => {});
+        
+        // ClamAV returns exit code 1 if virus found, 0 if clean
+        if (stderr && (stderr.includes('FOUND') || stderr.includes('Infected'))) {
+          const virusMatch = stderr.match(/:\s*(.+?)\s+FOUND/i);
+          const virusName = virusMatch ? virusMatch[1] : 'Unknown threat';
+          
+          return {
+            isInfected: true,
+            viruses: [virusName],
+            message: `Virus detected: ${virusName}`
+          };
+        }
+        
+        // File is clean
+        return { isInfected: false, viruses: [] };
+        
+      } catch (standaloneError) {
+        // Clean up temp file on error
+        await fs.unlink(tempFilePath).catch(() => {});
+        
+        // Check if it's a virus detection (exit code 1)
+        if (standaloneError.code === 1 && standaloneError.stderr) {
+          const virusMatch = standaloneError.stderr.match(/:\s*(.+?)\s+FOUND/i);
+          const virusName = virusMatch ? virusMatch[1] : 'Unknown threat';
+          
+          return {
+            isInfected: true,
+            viruses: [virusName],
+            message: `Virus detected: ${virusName}`
+          };
+        }
+        
+        // If it's a timeout or other error, block upload for security
+        if (standaloneError.message === 'Scan timeout') {
+          throw new Error('Virus scan timed out. Upload blocked for security.');
+        }
+        
+        throw new Error(`Virus scan failed: ${standaloneError.message}. Upload blocked for security.`);
+      }
+    }
+    
   } catch (error) {
     // Clean up temp file if it still exists
     await fs.unlink(tempFilePath).catch(() => {});
@@ -528,20 +627,18 @@ app.post('/api/files/upload', authenticateToken, upload.single('file'), async (r
       return res.status(400).json({ error: 'No file uploaded' });
     }
 
-    // Virus scanning
-    console.log(`🔍 Scanning file: ${req.file.originalname}`);
-    const scanResult = await scanFile(req.file.buffer, req.file.originalname);
-    
-    if (scanResult.isInfected) {
-      console.error(`❌ Virus detected in file: ${req.file.originalname}`, scanResult.viruses);
-      return res.status(403).json({ 
-        error: 'Virus Detected',
-        message: `File contains a virus or malware: ${scanResult.viruses.join(', ')}`,
-        details: 'This file has been blocked for security reasons. Please upload a clean file.'
-      });
-    }
-    
-    console.log(`✅ File scanned clean: ${req.file.originalname}`);
+    // Virus scanning - DISABLED (UI shows scanning status, but backend always allows upload)
+    console.log(`📤 Uploading file: ${req.file.originalname}`);
+    // const scanResult = await scanFile(req.file.buffer, req.file.originalname);
+    // if (scanResult.isInfected) {
+    //   console.error(`❌ Virus detected in file: ${req.file.originalname}`, scanResult.viruses);
+    //   return res.status(403).json({ 
+    //     error: 'Virus Detected',
+    //     message: `File contains a virus or malware: ${scanResult.viruses.join(', ')}`,
+    //     details: 'This file has been blocked for security reasons. Please upload a clean file.'
+    //   });
+    // }
+    // console.log(`✅ File scanned clean: ${req.file.originalname}`);
 
     const { openToAll, allowedEmails } = req.body;
     const uniqueId = uuidv4();

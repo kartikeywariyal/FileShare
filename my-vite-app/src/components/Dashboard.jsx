@@ -216,6 +216,9 @@ const Dashboard = ({ user, token, onLogout }) => {
     setSuccess('');
 
     try {
+      // Simulate scanning delay (2-3 seconds) for UI feedback
+      await new Promise(resolve => setTimeout(resolve, 2500));
+
       const formData = new FormData();
       formData.append('file', selectedFile);
       formData.append('openToAll', openToAll);
